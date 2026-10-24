@@ -1,4 +1,4 @@
-﻿/* SPDX-License-Identifier: GPL-2.0-or-later */
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 /*  * KPM 模块 
  * 开源作者: 小迷糊 @xmhnb
  * 描述: KPM hook ioctl 读写
@@ -33,6 +33,7 @@ KPM_DESCRIPTION("小迷糊开源HOOK_ioctl内核模块");
 
 /* ========== ioctl 命令定义 ========== */
 #define OP_READ_MEM                 8001
+#define OP_WRITE_MEM                8002 // ADDED FOR WRITE SUPPORT
 #define OP_GET_CPU_NUM_BRPS         8009
 #define OP_GET_CPU_NUM_WRPS         8010
 #define OP_SET_HW_BREAKPOINT        8011
@@ -385,6 +386,103 @@ static void before_ioctl(hook_fargs4_t *args, void *udata)
             remaining -= chunk;
             vaddr += chunk;
             outbuf += chunk;
+        }
+        return;
+    }
+
+    // ==========================================
+    // ADDED: OP_WRITE_MEM (8002) BLOCK
+    // ==========================================
+    if (cmd == OP_WRITE_MEM) {
+        copy_memory_t rcmd;
+        if (kf___arch_copy_from_user(&rcmd, (void __user *)user_data, sizeof(rcmd)))
+            return;
+        uint64_t remaining = rcmd.size;
+        if (!remaining) return;
+        uint64_t vaddr = rcmd.addr;
+        uint64_t inbuf = rcmd.buffer;
+
+        while (remaining) {
+            uint64_t pgsz = 1ULL << my_page_shift;
+            uint64_t pgoff = vaddr & (pgsz - 1);
+            uint64_t chunk = pgsz - pgoff;
+            if (chunk > remaining) chunk = remaining;
+
+            void *task = kf_find_task_by_vpid(rcmd.pid);
+            if (!task) goto next_chunk_w;
+            void *mm = kf_get_task_mm(task);
+            if (!mm) goto next_chunk_w;
+
+            uint64_t ps = my_page_shift;
+            uint64_t vb = my_va_bits;
+            uint64_t es = ps - 3;
+            int64_t levels = (int64_t)((vb - 4) / es);
+            uint64_t phys_addr = 0;
+
+            if (levels >= 1) {
+                int64_t level = 4 - levels;
+                uint64_t tbl = *(uint64_t *)((uint64_t)mm + pgd_offset);
+                uint64_t pmask = ~(-1ULL << (48 - (uint8_t)ps)) << ps;
+                uint64_t imask = (1U << es) - 1;
+                int found = 0;
+
+                while (!found) {
+                    uint64_t shift = (4 - (uint8_t)level) * es + 3;
+                    uint64_t idx = (vaddr >> shift) & imask;
+                    uint64_t entry = *(uint64_t *)(tbl + idx * 8);
+                    uint64_t dt = entry & 3;
+
+                    if (dt == 3) {
+                        tbl = (pmask & entry) + (-1ULL << vb) - *(uint64_t *)kv_memstart_addr;
+                        level++;
+                        if (level >= 3) { found = 1; break; }
+                    } else if (dt == 1) {
+                        if (level == 0) {
+                            pmask = ~(-1ULL << (48 - ((uint8_t)ps + 3 * es))) << ((uint8_t)ps + 3 * es);
+                            tbl = (pmask & entry) + (-1ULL << vb) - *(uint64_t *)kv_memstart_addr;
+                            level++;
+                            if (level >= 3) { found = 1; break; }
+                            continue;
+                        }
+                        found = 1; break;
+                    } else {
+                        break;
+                    }
+                }
+
+                if (found) {
+                    uint64_t shift = (4 - (uint8_t)level) * es + 3;
+                    uint64_t idx = (vaddr >> shift) & imask;
+                    uint64_t entry = *(uint64_t *)(tbl + idx * 8);
+                    if ((~(uint16_t)entry & 0x401) == 0) {
+                        uint64_t pa_frame = 0;
+                        if (my_pa_bits == 52)
+                            pa_frame = (entry << 36) & 0xF000000000000ULL;
+                        phys_addr = (pa_frame + (entry & pmask)) & (-1ULL << ps);
+                        phys_addr |= vaddr & ~(-1ULL << ps);
+                    }
+                }
+            }
+
+            if (kf_mmput) kf_mmput(mm);
+
+            if (phys_addr) {
+                if (kf_pfn_valid(phys_addr >> my_page_shift) &&
+                    kf_valid_phys_addr_range(phys_addr, chunk)) {
+                    uint64_t kva = (phys_addr & (-1ULL << my_page_shift))
+                                 - *(uint64_t *)kv_memstart_addr
+                                 + (-1ULL << my_va_bits)
+                                 + (phys_addr & ~(-1ULL << my_page_shift));
+                    
+                    // Write into kernel memory from user buffer
+                    kf___arch_copy_from_user((void *)kva, (void __user *)inbuf, chunk);
+                }
+            }
+
+        next_chunk_w:
+            remaining -= chunk;
+            vaddr += chunk;
+            inbuf += chunk;
         }
         return;
     }
